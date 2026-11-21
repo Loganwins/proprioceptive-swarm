@@ -3,8 +3,8 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "proprioceptive-swarm"
-version = "0.1.6"
-description = "Client SDK for the Proprioceptive AI lens-swarm: CPU consensus answering with confidence gates and receipted audit trail. Requires account signup; inert without an API key."
+version = "0.1.7"
+description = "Client SDK for the Proprioceptive AI lens-swarm: CPU consensus answering with confidence gates, verdict hooks, batch runs, and receipted audit trail export. Requires account signup; inert without an API key."
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "Proprietary"}

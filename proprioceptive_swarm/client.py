@@ -1,4 +1,5 @@
-import json, os, time, urllib.request, urllib.error
+import hashlib, json, math, os, time, urllib.parse, urllib.request, urllib.error
+from typing import Sequence
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     """Never let the API key ride a redirect to another host; POST redirects get refused."""
@@ -47,9 +48,31 @@ def _post(path, obj=None, key=None, timeout=180):
     except Exception as e:
         raise SwarmError("network: %s" % type(e).__name__)
 
+def _get(path, key=None, timeout=60):
+    """GET a JSON object response through the guarded opener (same error posture as status())."""
+    headers = {"X-API-Key": key} if key else {}
+    req = urllib.request.Request(API + path, headers=headers)
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            out = json.loads(r.read())
+        if not isinstance(out, dict): raise SwarmError("malformed response from service")
+        return out
+    except urllib.error.HTTPError as e:
+        try:
+            body = json.loads(e.read())
+            if not isinstance(body, dict): body = {}
+        except Exception: body = {}
+        if e.code in (401, 403): raise SwarmNotAuthorized()
+        raise SwarmError("HTTP %s: %s" % (e.code, str(body.get("error", "?"))[:200]))
+    except SwarmError: raise
+    except Exception as e:
+        raise SwarmError("network: %s" % type(e).__name__)
+
 class Swarm:
     """Gated consensus client. answer() returns selected option, agreement,
     confidence flag, quota state, and a hash-chained receipt id."""
+    HOOK_VERDICTS = ("proceed", "abstain", "repair")
+
     def __init__(self, api_key=None, client_id=None):
         cfg = {}
         if os.path.exists(CFG):
@@ -96,6 +119,108 @@ class Swarm:
         if not self.key: raise SwarmNotAuthorized()
         return _post("/v1/swarm/select", {"question": question, "choices": list(choices),
                                           "model": model}, key=self.key)
+
+    def hook(self, model_family, state):
+        """Ask the server-side hook head for a verdict on a model state vector.
+        POSTs /v1/swarm/hook {"model_family", "state"} with the API key; the reply is a
+        verdict-only passthrough dict: {"hook_verdict": proceed|abstain|repair, "margin",
+        "model", "client_id", "evidence", quota fields, "receipt", "version"}.
+        CLIENT-SIDE GUARD (runs BEFORE any network call, so a wrong local vector costs
+        the user nothing): model_family must be a 1-64 char string and state exactly 16
+        finite non-bool numbers, else SwarmError. The response is accepted only if
+        hook_verdict is one of proceed|abstain|repair; anything else raises SwarmError.
+        No model internals are sent or received — the head lives server-side."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not isinstance(model_family, str) or not (1 <= len(model_family) <= 64):
+            raise SwarmError("model_family must be a non-empty string <=64 chars; nothing was sent")
+        try:
+            st = list(state)
+        except TypeError:
+            raise SwarmError("state must be a sequence of exactly 16 floats; nothing was sent")
+        if len(st) != 16:
+            raise SwarmError("state must be exactly 16 floats (got %d); nothing was sent" % len(st))
+        if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in st):
+            raise SwarmError("state must contain only numbers (got %s); nothing was sent"
+                             % next(type(x).__name__ for x in st
+                                    if isinstance(x, bool) or not isinstance(x, (int, float))))
+        feats = [float(x) for x in st]
+        if not all(math.isfinite(y) for y in feats):
+            bad = next(i for i, y in enumerate(feats) if not math.isfinite(y))
+            raise SwarmError("state must be finite (index %d is NaN or +/-inf); nothing was sent" % bad)
+        r = _post("/v1/swarm/hook", {"model_family": model_family, "state": feats}, key=self.key)
+        if r.get("hook_verdict") not in self.HOOK_VERDICTS:
+            raise SwarmError("service returned an invalid hook_verdict: %r" % (r.get("hook_verdict"),))
+        return r
+
+    def batch(self, items):
+        """Run up to 25 select|hook items in one authorized call (POST /v1/swarm/batch,
+        body {"items": [...]}). Returns the server's result dict (per-item verdicts +
+        summary + batch receipt). CLIENT-SIDE GUARD before sending: items must be a list
+        with 1 <= len(items) <= 25, else SwarmError — an out-of-range batch never leaves
+        the machine and never costs quota."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not isinstance(items, list):
+            raise SwarmError("batch items must be a list (got %s); nothing was sent"
+                             % type(items).__name__)
+        if not (1 <= len(items) <= 25):
+            raise SwarmError("batch requires 1-25 items (got %d); nothing was sent" % len(items))
+        return _post("/v1/swarm/batch", {"items": items}, key=self.key)
+
+    def export(self, since=None, until=None):
+        """GET /v1/swarm/export?since=<ts>&until=<ts> — fetch the caller's receipt-chain
+        export bundle as a dict {"events": [ledger records...], ...}. since/until are
+        optional epoch-second bounds; None omits the param. Validate any returned bundle
+        with verify_export() before trusting it."""
+        if not self.key: raise SwarmNotAuthorized()
+        params = {}
+        for name, val in (("since", since), ("until", until)):
+            if val is not None:
+                if isinstance(val, bool):
+                    raise SwarmError("%s must be an epoch-seconds integer" % name)
+                try: val = int(val)
+                except (TypeError, ValueError):
+                    raise SwarmError("%s must be an epoch-seconds integer" % name)
+                params[name] = val
+        qs = ("?" + urllib.parse.urlencode(params)) if params else ""
+        return _get("/v1/swarm/export" + qs, key=self.key)
+
+    def verify_export(self, bundle):
+        """Walk an export bundle's hash chain and return True only if every link recomputes.
+        Chain convention (mirrors the server's receipt() writer and verify_bundle exactly,
+        lens-swarm edge >= 1.8.3):
+          * signed payload = record minus the chain/meta keys {sha, prev, prev_sha, index,
+            event_type}; raw = json.dumps(payload, sort_keys=True);
+          * sha = sha256(PREV_FULL_SHA + raw) where PREV_FULL_SHA is the record's own
+            prev_sha field (full 64-hex; "" at ledger genesis) in bundle form, or the
+            previous record's sha in raw ledger form (sequential chain);
+          * in bundle form, when consecutive events are adjacent in the global ledger
+            (index difference == 1) the embedded prev_sha must equal the preceding event's
+            sha - catches splicing; a gap is an honest cross-client omission, not a break.
+        An empty events list is vacuously intact (True). A bundle that is not a dict with
+        an "events" list raises SwarmError (shape problem, not a chain verdict)."""
+        if not isinstance(bundle, dict) or not isinstance(bundle.get("events"), list):
+            raise SwarmError("export bundle must be a dict containing an 'events' list")
+        _META = ("sha", "prev", "prev_sha", "index", "event_type")
+        prev = ""
+        prev_index = None
+        for e in bundle["events"]:
+            if not isinstance(e, dict) or not isinstance(e.get("sha"), str) or not e.get("sha"):
+                return False
+            payload = {k: v for k, v in e.items() if k not in _META}
+            if isinstance(e.get("prev_sha"), str):
+                base = e["prev_sha"]
+                idx = e.get("index")
+                if (prev_index is not None and isinstance(idx, int) and idx == prev_index + 1
+                        and base != prev):
+                    return False
+            else:
+                base = prev
+            chk = hashlib.sha256((base + json.dumps(payload, sort_keys=True)).encode()).hexdigest()
+            if chk != e["sha"]:
+                return False
+            prev = e["sha"]
+            prev_index = e.get("index") if isinstance(e.get("index"), int) else None
+        return True
 
     def status(self):
         """Quota/tier for this key: {'client_id','tier','used_today','limit',...}."""
