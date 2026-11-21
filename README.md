@@ -35,3 +35,10 @@ null p70 bits; precision = flagged-on-wrong rate at thr. Live matrix: `GET /v1/s
 
 Certification != deployment entitlement: entropy flags fire only where the admin enables the
 feature; `serving` rows are the CPU tier live today. No model's raw logits leave the boundary.
+
+## License
+
+The client code in this repository is licensed under the [Apache License, Version 2.0](LICENSE).
+Copyright (c) 2026 Proprioceptive AI.
+
+The separately hosted backend, Behaviour probes, scoring service, and private probe assets are not included in this repository and remain proprietary. This boundary does not modify the terms of the Apache License for the included client code.
