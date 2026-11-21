@@ -2,14 +2,17 @@ import json, os, time, urllib.request, urllib.error
 
 class _SafeRedirect(urllib.request.HTTPRedirectHandler):
     """Never let the API key ride a redirect to another host; POST redirects get refused."""
-    def redirect_request(self, req, fp, code, msg, newheaders, newurl):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
         if req.data is not None and code in (301, 302, 303):
-            raise urllib.error.HTTPError(newurl, code, "redirect refused for POST", newheaders, fp)
+            raise urllib.error.HTTPError(newurl, code, "redirect refused for POST", headers, fp)
         from urllib.parse import urlparse
-        if urlparse(req.fullurl).netloc != urlparse(newurl).netloc:
-            for h in list(newheaders):
-                if h.lower() in ("x-api-key", "authorization"): del newheaders[h]
-        return super().redirect_request(req, fp, code, msg, newheaders, newurl)
+        newreq = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if newreq is not None and urlparse(req.full_url).netloc != urlparse(newurl).netloc:
+            for hdr in ("X-API-Key", "Authorization"):
+                if newreq.has_header(hdr): newreq.remove_header(hdr)
+                for d in (getattr(newreq, "headers", {}), getattr(newreq, "unredirected_hdrs", {})):
+                    for kk in [k2 for k2 in list(d) if k2.lower() == hdr.lower()]: del d[kk]
+        return newreq
 
 _OPENER = urllib.request.build_opener(_SafeRedirect)
 
@@ -33,14 +36,16 @@ def _post(path, obj=None, key=None, timeout=180):
         if not isinstance(out, dict): raise SwarmError("malformed response from service")
         return out
     except urllib.error.HTTPError as e:
-        try: body = json.loads(e.read())
-        except Exception: body = {"error": str(e)}
+        try:
+            body = json.loads(e.read())
+            if not isinstance(body, dict): body = {"error": "malformed error body"}
+        except Exception: body = {"error": "unreadable error body"}
         if e.code in (401, 403): raise SwarmNotAuthorized()
         if e.code == 429:
             raise SwarmError(body.get("error") or ("limit reached: %s" % body.get("limit")))
-        raise SwarmError("HTTP %s: %s" % (e.code, body.get("error", "?")))
+        raise SwarmError("HTTP %s: %s" % (e.code, str(body.get("error", "?"))[:200]))
     except Exception as e:
-        raise SwarmError("network: %r" % e)
+        raise SwarmError("network: %s" % type(e).__name__)
 
 class Swarm:
     """Gated consensus client. answer() returns selected option, agreement,
@@ -93,21 +98,46 @@ class Swarm:
                                           "model": model}, key=self.key)
 
     def status(self):
-        """Quota/tier for this key: {'client_id','tier','used_today','limit'}."""
+        """Quota/tier for this key: {'client_id','tier','used_today','limit',...}."""
         if not self.key: raise SwarmNotAuthorized()
         req = urllib.request.Request(API + "/v1/swarm/status", headers={"X-API-Key": self.key})
         try:
-            return json.loads(urllib.request.urlopen(req, timeout=30).read())
+            with _OPENER.open(req, timeout=60) as r:
+                out = json.loads(r.read())
+            if not isinstance(out, dict): raise SwarmError("malformed status response")
+            return out
         except urllib.error.HTTPError as e:
             if e.code in (401, 403): raise SwarmNotAuthorized()
-            try: body = json.loads(e.read())
+            try:
+                body = json.loads(e.read())
+                if not isinstance(body, dict): body = {}
             except Exception: body = {}
-            raise SwarmError("HTTP %s: %s" % (e.code, body.get("error", "?")))
+            raise SwarmError("HTTP %s: %s" % (e.code, str(body.get("error", "?"))[:200]))
+        except SwarmError: raise
+        except Exception as e:
+            raise SwarmError("network: %s" % type(e).__name__)
 
     def verify(self, receipt_id):
-        """Fetch + chain-verify a receipt by id (prefix ok)."""
-        r = urllib.request.urlopen(API + "/v1/swarm/verify/" + receipt_id, timeout=30).read()
-        return json.loads(r)
+        """Fetch + chain-verify a receipt by id (prefix ok). Owner receipts return
+        full payload; non-owners get chain-integrity fields only (A10 posture)."""
+        if not receipt_id or len(str(receipt_id)) < 8:
+            raise SwarmError("receipt prefix must be >= 8 chars")
+        headers = {"X-API-Key": self.key} if self.key else {}
+        try:
+            with _OPENER.open(urllib.request.Request(API + "/v1/swarm/verify/" + urllib.parse.quote(str(receipt_id)), headers=headers), timeout=60) as r:
+                out = json.loads(r.read())
+            if not isinstance(out, dict): raise SwarmError("malformed verify response")
+            return out
+        except urllib.error.HTTPError as e:
+            if e.code == 404: return {"chain_integrity": "NOT_FOUND"}
+            try:
+                body = json.loads(e.read())
+                if not isinstance(body, dict): body = {}
+            except Exception: body = {}
+            raise SwarmError("HTTP %s: %s" % (e.code, str(body.get("error", "?"))[:200]))
+        except SwarmError: raise
+        except Exception as e:
+            raise SwarmError("network: %s" % type(e).__name__)
 
     def order_stub(self, model="qwen2.5-0.5b-inst", note=""):
         """Draft a DISTILL-ORDER ticket locally (SKU intake only).
@@ -131,4 +161,4 @@ class Swarm:
 
     def health(self):
         return _post("/v1/swarm/health", {}) if False else json.loads(
-            urllib.request.urlopen(API + "/v1/swarm/health", timeout=15).read())
+            _OPENER.open(API + "/v1/swarm/health", timeout=15).read())
