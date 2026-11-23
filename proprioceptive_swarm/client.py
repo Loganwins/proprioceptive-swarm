@@ -129,6 +129,8 @@ class Swarm:
         the user nothing): model_family must be a 1-64 char string and state exactly 16
         finite non-bool numbers, else SwarmError. The response is accepted only if
         hook_verdict is one of proceed|abstain|repair; anything else raises SwarmError.
+        model_family accepts the advertised aliases: "phi-2" and "Qwen2.5-1.5B" /
+        "Qwen2.5-1.5B-Instruct" resolve server-side to their certified heads.
         No model internals are sent or received — the head lives server-side."""
         if not self.key: raise SwarmNotAuthorized()
         if not isinstance(model_family, str) or not (1 <= len(model_family) <= 64):
@@ -263,6 +265,22 @@ class Swarm:
         except SwarmError: raise
         except Exception as e:
             raise SwarmError("network: %s" % type(e).__name__)
+
+    def proof(self, receipt_prefix):
+        """GET /v1/swarm/proof/<prefix> — OWNER-ONLY inclusion proof (edge >= 1.8.6).
+        Sends the stored API key as X-API-Key; the service matches the prefix against
+        YOUR receipts only and returns {position, receipt_sha, prev, record,
+        proof: "inclusion", head_sha, head_count, verify_hint}, or the integrity
+        verdict {chain_integrity: "NOT_FOUND", head_count} passed through as-is
+        (200-body posture, same as verify()). 4xx maps to the standard client errors:
+        401/403 -> SwarmNotAuthorized, anything else -> SwarmError. Third parties who
+        need integrity-only checks use verify() (no key required).
+        CLIENT-SIDE GUARD before any network call: prefix must be >= 8 chars, else
+        SwarmError. The client computes nothing — every field is the server's chain."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not receipt_prefix or len(str(receipt_prefix)) < 8:
+            raise SwarmError("receipt prefix must be >= 8 chars; nothing was sent")
+        return _get("/v1/swarm/proof/" + urllib.parse.quote(str(receipt_prefix)), key=self.key)
 
     def order_stub(self, model="qwen2.5-0.5b-inst", note=""):
         """Draft a DISTILL-ORDER ticket locally (SKU intake only).
