@@ -14,6 +14,43 @@ Evidence basis: verification-economics routing (23.5x), per-model uncertainty ce
 custody receipts (1290+, zero escapes). Claims are graded; see provider disclosures.
 
 
+## Swarm control plane (live — production edge >= 1.8.7)
+
+Register your own swarm of up to **500 agents** per account and drive it through four
+routes plus the judge. Everything stays server-side; the plane is contract-only here —
+no internals are documented or shipped by this SDK.
+
+| Method | Route | Costs quota? |
+|---|---|---|
+| `s.agents_register(name, family)` | `POST /v1/swarm/agents/register` | no |
+| `s.agents_list()` | `GET /v1/swarm/agents` (owner-scoped) | no |
+| `s.agents_gate(agent_id, state)` | `POST /v1/swarm/agents/gate` | **yes — shared account quota** |
+| `s.agents_remove(agent_id)` | `POST /v1/swarm/agents/remove` | no |
+| `s.judge(question, choices, votes)` | `POST /v1/swarm/judge` | **yes** |
+
+- `agents_register` returns `{ok, client_id, agent_id (agt_-prefixed), family, name_sha,
+  n_agents, cap: 500, receipt, version}`; `family` is passed through for server-side
+  validation (advertised aliases like `phi-2` resolve to certified heads).
+- `agents_gate` sends your 16-float state vector to one agent and returns a **verdict-only**
+  hook response (`hook_verdict` proceed|abstain|repair) carrying that agent's counters:
+  `flagged`, `verdicts_seen`, `flagged_count`, plus `quota_used_today`. Gates draw from the
+  same daily quota as every other billable call.
+- `judge` is the **positional de-bias judge** (`lens-swarm-judge-1.0`): give it the question,
+  the choices, and `votes` = a list of `{agent_id, answer_index}` — one vote per agent, up
+  to 50; duplicate agent ids are rejected with a 4xx. It returns `{converged, answer_index,
+  leaning_index, agreement, n_agents, dissent, tied_indices, debias_offset, reason, n_votes,
+  receipt, ...}`. The judge corrects for answer position across your agents' votes; how it
+  does that is server-side and outside this contract.
+
+```
+s = Swarm()                                   # signup once, key kept in ~/.palswarm.json
+a = s.agents_register("scout-1", "phi-2")     # -> a["agent_id"] (agt_...)
+v = s.agents_gate(a["agent_id"], state16)     # verdict-only; costs 1 quota
+j = s.judge("Q?", ["yes", "no"],
+            [{"agent_id": x, "answer_index": i} for x, i in swarm_votes])
+s.agents_remove(a["agent_id"])                # free
+```
+
 ## Receipt proofs and integrity checks
 
 Every response carries a hash-chained receipt id. Two routes, two audiences:

@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Self-contained functional suite for the proprioceptive-swarm client SDK (0.1.8).
+"""Self-contained functional suite for the proprioceptive-swarm client SDK (0.1.9).
 
 Runs entirely against a local stub edge on an ephemeral 127.0.0.1 port — nothing
 external is touched. Covers: signup credential persistence, answer/select/hook/batch/
 export/status/verify, the 0.1.8 proof route (owner gate, inclusion happy path,
-NOT_FOUND passthrough, 401 mapping, prefix guard), the client-side guards that must
-never put bytes on the wire, and the verify_export chain walker against a chain built
-with the server's exact sha convention.
+NOT_FOUND passthrough, 401 mapping, prefix guard), the 0.1.9 swarm control plane
+(agents_register/agents_list/agents_gate/agents_remove/judge: verdict-only shapes,
+no-leak key allowlist, quota-shared gate fields, duplicate-vote rejection), and the
+client-side guards that must never put bytes on the wire, plus the verify_export chain
+walker against a chain built with the server's exact sha convention.
 
 Run:  python3 -m unittest discover -s tests -v   (from the repo root)
 """
@@ -135,7 +137,7 @@ class StubCase(unittest.TestCase):
 # ---------------------------------------------------------------- version meta
 class TestVersion(unittest.TestCase):
     def test_pkg_version(self):
-        self.assertEqual(pkg.__version__, "0.1.8")
+        self.assertEqual(pkg.__version__, "0.1.9")
 
     def test_exports(self):
         self.assertEqual(sorted(pkg.__all__), sorted(["Swarm", "SwarmNotAuthorized", "SwarmError"]))
@@ -493,6 +495,229 @@ class TestRedirectGuard(StubCase):
         same = h.redirect_request(getreq, None, 302, "Found", Message(),
                                   "https://api.example.com/v1/y")
         self.assertTrue(_hdr(same, "x-api-key"))
+
+
+# ------------------------------------------------- swarm control plane (0.1.9)
+AID = "agt_ab026178126b"
+# Verdict-only gate response keys per the published contract (edge >= 1.8.7).
+# Anything outside this allowlist on a gate reply is a leak: the no-leak test
+# pins the response keys to exactly this set.
+GATE_ALLOW = {"hook_verdict", "margin", "model", "evidence", "client_id", "agent_id",
+              "flagged", "verdicts_seen", "flagged_count", "quota_used_today",
+              "quota_limit", "trial_total_cap", "trial_expires", "receipt", "version"}
+
+
+def gate_resp(verdict="proceed", flagged=False, seen=1, fc=0, used=1):
+    return {"hook_verdict": verdict, "margin": 0.4898, "model": "phi2",
+            "evidence": "verdict-only", "client_id": "c-1", "agent_id": AID,
+            "flagged": flagged, "verdicts_seen": seen, "flagged_count": fc,
+            "quota_used_today": used, "quota_limit": 140, "trial_total_cap": 500,
+            "trial_expires": 9999, "receipt": "43" * 8, "version": "1.8.7"}
+
+
+class TestAgentsRegister(StubCase):
+    ROUTE = ("POST", "/v1/swarm/agents/register")
+
+    def test_register_happy(self):
+        self.srv.routes[self.ROUTE] = (
+            200, {"ok": True, "client_id": "c-1", "agent_id": AID, "family": "phi-2",
+                  "name_sha": "6794af8371f2", "n_agents": 1, "cap": 500,
+                  "receipt": "ad" * 8, "version": "1.8.7"})
+        r = self.sw().agents_register("scout-1", "phi-2")
+        self.assertTrue(r["ok"])
+        self.assertTrue(r["agent_id"].startswith("agt_"))
+        self.assertEqual(r["cap"], 500)
+        self.assertEqual(self.srv.hits[0][2].get("x-api-key"), "k-test-key")
+        self.assertEqual(self.srv.last_body, {"name": "scout-1", "family": "phi-2"})
+
+    def test_register_family_passthrough_no_local_validation(self):
+        """The client must not pre-validate family: whatever the server accepts (or
+        rejects) is the server's call — the exact string has to reach the wire."""
+        self.srv.routes[self.ROUTE] = (
+            200, {"ok": True, "client_id": "c-1", "agent_id": AID,
+                  "family": "weird/FAMILY 9", "name_sha": "x" * 12, "n_agents": 1,
+                  "cap": 500, "receipt": "ad" * 8, "version": "1.8.7"})
+        r = self.sw().agents_register("odd", "weird/FAMILY 9")
+        self.assertEqual(self.srv.last_body["family"], "weird/FAMILY 9")
+        self.assertEqual(r["family"], "weird/FAMILY 9")
+
+    def test_register_server_family_validation_error_passes_through(self):
+        self.srv.routes[self.ROUTE] = (400, {"error": "unsupported family: qwen-9000"})
+        with self.assertRaises(SwarmError) as cm:
+            self.sw().agents_register("a", "qwen-9000")
+        self.assertIn("unsupported family", str(cm.exception))
+
+    def test_register_without_key_never_touches_wire(self):
+        with self.assertRaises(SwarmNotAuthorized):
+            Swarm(api_key=None).agents_register("a", "phi-2")
+        self.assertEqual(self.wire(), [])
+
+
+class TestAgentsList(StubCase):
+    def test_list_owner_scoped_get_with_key(self):
+        self.srv.routes[("GET", "/v1/swarm/agents")] = (
+            200, {"product": "lens-swarm-1.8.7", "version": "1.8.7", "client_id": "c-1",
+                  "count": 1, "cap": 500,
+                  "agents": [{"agent_id": AID, "family": "phi-2", "verdicts_seen": 0,
+                              "last_verdict": None, "flagged_count": 0}]})
+        r = self.sw().agents_list()
+        self.assertEqual(r["product"], "lens-swarm-1.8.7")
+        self.assertEqual(r["count"], 1)
+        self.assertEqual(r["agents"][0]["agent_id"], AID)
+        m, path, hdrs = self.srv.hits[0]
+        self.assertEqual(m, "GET")
+        self.assertEqual(path, "/v1/swarm/agents")
+        self.assertEqual(hdrs.get("x-api-key"), "k-test-key")
+
+    def test_list_without_key_never_touches_wire(self):
+        with self.assertRaises(SwarmNotAuthorized):
+            Swarm(api_key=None).agents_list()
+        self.assertEqual(self.wire(), [])
+
+
+class TestAgentsGate(StubCase):
+    ROUTE = ("POST", "/v1/swarm/agents/gate")
+
+    def test_gate_proceed_shape(self):
+        self.srv.routes[self.ROUTE] = (200, gate_resp("proceed"))
+        r = self.sw().agents_gate(AID, GOOD)
+        self.assertEqual(r["hook_verdict"], "proceed")
+        self.assertFalse(r["flagged"])
+        self.assertEqual(self.srv.last_body["agent_id"], AID)
+        self.assertEqual(self.srv.last_body["state"], GOOD)
+
+    def test_gate_abstain_shape_with_counters_and_shared_quota(self):
+        self.srv.routes[self.ROUTE] = (200, gate_resp("abstain", flagged=True, seen=2,
+                                                      fc=1, used=3))
+        r = self.sw().agents_gate(AID, GOOD)
+        self.assertEqual(r["hook_verdict"], "abstain")
+        self.assertEqual(r["verdicts_seen"], 2)
+        self.assertEqual(r["flagged_count"], 1)
+        self.assertTrue(r["flagged"])
+        # gates draw on the shared daily quota, visible on the reply itself
+        self.assertEqual(r["quota_used_today"], 3)
+        self.assertEqual(r["quota_limit"], 140)
+
+    def test_gate_response_respects_no_leak_key_allowlist(self):
+        self.srv.routes[self.ROUTE] = (200, gate_resp("repair", flagged=True, seen=3,
+                                                      fc=2, used=4))
+        r = self.sw().agents_gate(AID, GOOD)
+        self.assertLessEqual(set(r.keys()), GATE_ALLOW,
+                             "gate reply carried keys outside the verdict-only contract")
+        self.assertLessEqual(set(self.srv.last_body.keys()), {"agent_id", "state"},
+                             "gate request must carry only agent_id and the user's state")
+
+    def test_gate_invalid_verdict_rejected(self):
+        bad = gate_resp("proceed")
+        bad["hook_verdict"] = "maybe"
+        self.srv.routes[self.ROUTE] = (200, bad)
+        with self.assertRaises(SwarmError):
+            self.sw().agents_gate(AID, GOOD)
+
+    def _guard(self, agent_id, state):
+        with self.assertRaises(SwarmError):
+            self.sw().agents_gate(agent_id, state)
+        self.assertEqual(self.wire(), [], "guard must not touch the wire")
+
+    def test_gate_state_short_guard(self):
+        self._guard(AID, [1.0] * 15)
+
+    def test_gate_state_nan_guard(self):
+        self._guard(AID, [float("nan")] + [1.0] * 15)
+
+    def test_gate_empty_agent_id_guard(self):
+        self._guard("", GOOD)
+
+    def test_gate_401_without_server_key_maps_to_not_authorized(self):
+        self.srv.routes[self.ROUTE] = (401, {"error": "missing key"})
+        with self.assertRaises(SwarmNotAuthorized):
+            self.sw(key="k-revoked").agents_gate(AID, GOOD)
+
+    def test_gate_without_key_never_touches_wire(self):
+        with self.assertRaises(SwarmNotAuthorized):
+            Swarm(api_key=None).agents_gate(AID, GOOD)
+        self.assertEqual(self.wire(), [])
+
+
+class TestAgentsRemove(StubCase):
+    def test_remove_happy(self):
+        self.srv.routes[("POST", "/v1/swarm/agents/remove")] = (
+            200, {"ok": True, "client_id": "c-1", "agent_id": AID, "n_agents": 0,
+                  "cap": 500, "receipt": "b8" * 8, "version": "1.8.7"})
+        r = self.sw().agents_remove(AID)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["n_agents"], 0)
+        self.assertEqual(self.srv.last_body, {"agent_id": AID})
+
+    def test_remove_without_key_never_touches_wire(self):
+        with self.assertRaises(SwarmNotAuthorized):
+            Swarm(api_key=None).agents_remove(AID)
+        self.assertEqual(self.wire(), [])
+
+
+class TestJudge(StubCase):
+    ROUTE = ("POST", "/v1/swarm/judge")
+
+    def test_judge_majority(self):
+        self.srv.routes[self.ROUTE] = (
+            200, {"product": "lens-swarm-judge-1.0", "client_id": "c-1",
+                  "converged": True, "answer_index": 1, "leaning_index": 1,
+                  "agreement": 0.6667, "n_agents": 3,
+                  "dissent": [{"agent_id": "agt_c" * 4, "answer_index": 0}],
+                  "tied_indices": [], "debias_offset": 1, "reason": "majority",
+                  "n_votes": 3, "quota_used_today": 5, "quota_limit": 140,
+                  "receipt": "41" * 8, "version": "1.8.7"})
+        votes = [{"agent_id": AID, "answer_index": 1},
+                 {"agent_id": "agt_b", "answer_index": 1},
+                 {"agent_id": "agt_c" * 4, "answer_index": 0}]
+        r = self.sw().judge("Is the sky blue?", ["no", "yes"], votes)
+        self.assertEqual(r["product"], "lens-swarm-judge-1.0")
+        self.assertTrue(r["converged"])
+        self.assertEqual(r["answer_index"], 1)   # 2-of-3 majority
+        self.assertEqual(r["n_votes"], 3)
+        # wire contract: third field is "items", each item only {agent_id, answer_index}
+        body = self.srv.last_body
+        self.assertEqual(set(body.keys()), {"question", "choices", "items"})
+        self.assertEqual(body["items"], [{"agent_id": AID, "answer_index": 1},
+                                         {"agent_id": "agt_b", "answer_index": 1},
+                                         {"agent_id": "agt_c" * 4, "answer_index": 0}])
+        self.assertEqual(self.srv.hits[0][2].get("x-api-key"), "k-test-key")
+
+    def test_judge_duplicate_agent_rejected_4xx(self):
+        self.srv.routes[self.ROUTE] = (
+            400, {"error": "duplicate agent_id in items", "item_index": 1, "agent_id": AID})
+        with self.assertRaises(SwarmError) as cm:
+            self.sw().judge("Q?", ["a", "b"],
+                            [{"agent_id": AID, "answer_index": 0},
+                             {"agent_id": AID, "answer_index": 1}])
+        self.assertIn("duplicate agent_id", str(cm.exception))
+        self.assertIn("400", str(cm.exception))
+
+    def _guard(self, votes):
+        with self.assertRaises(SwarmError):
+            self.sw().judge("Q?", ["a", "b"], votes)
+        self.assertEqual(self.wire(), [], "guard must not touch the wire")
+
+    def test_judge_guard_empty_votes(self):
+        self._guard([])
+
+    def test_judge_guard_not_a_list(self):
+        self._guard({"agent_id": AID, "answer_index": 0})
+
+    def test_judge_guard_over_50_votes(self):
+        self._guard([{"agent_id": "agt_%d" % i, "answer_index": 0} for i in range(51)])
+
+    def test_judge_guard_missing_fields(self):
+        self._guard([{"agent_id": AID}])
+
+    def test_judge_guard_bool_answer_index(self):
+        self._guard([{"agent_id": AID, "answer_index": True}])
+
+    def test_judge_without_key_never_touches_wire(self):
+        with self.assertRaises(SwarmNotAuthorized):
+            Swarm(api_key=None).judge("Q?", ["a", "b"],
+                                      [{"agent_id": AID, "answer_index": 0}])
+        self.assertEqual(self.wire(), [])
 
 
 if __name__ == "__main__":

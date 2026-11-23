@@ -20,6 +20,26 @@ _OPENER = urllib.request.build_opener(_SafeRedirect)
 API = os.environ.get("PALSWARM_API", "https://api.proprioceptiveai.com")
 CFG = os.path.join(os.path.expanduser("~"), ".palswarm.json")
 
+def _state16(state):
+    """Client-side guard shared by hook() and agents_gate(): the user's own state
+    vector must be exactly 16 finite, non-bool numbers. Raises SwarmError BEFORE any
+    network call, so a wrong local vector costs the user nothing (no quota burned)."""
+    try:
+        st = list(state)
+    except TypeError:
+        raise SwarmError("state must be a sequence of exactly 16 floats; nothing was sent")
+    if len(st) != 16:
+        raise SwarmError("state must be exactly 16 floats (got %d); nothing was sent" % len(st))
+    if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in st):
+        raise SwarmError("state must contain only numbers (got %s); nothing was sent"
+                         % next(type(x).__name__ for x in st
+                                if isinstance(x, bool) or not isinstance(x, (int, float))))
+    feats = [float(x) for x in st]
+    if not all(math.isfinite(y) for y in feats):
+        bad = next(i for i, y in enumerate(feats) if not math.isfinite(y))
+        raise SwarmError("state must be finite (index %d is NaN or +/-inf); nothing was sent" % bad)
+    return feats
+
 class SwarmError(Exception): pass
 class SwarmNotAuthorized(SwarmError):
     def __init__(self):
@@ -135,20 +155,7 @@ class Swarm:
         if not self.key: raise SwarmNotAuthorized()
         if not isinstance(model_family, str) or not (1 <= len(model_family) <= 64):
             raise SwarmError("model_family must be a non-empty string <=64 chars; nothing was sent")
-        try:
-            st = list(state)
-        except TypeError:
-            raise SwarmError("state must be a sequence of exactly 16 floats; nothing was sent")
-        if len(st) != 16:
-            raise SwarmError("state must be exactly 16 floats (got %d); nothing was sent" % len(st))
-        if any(isinstance(x, bool) or not isinstance(x, (int, float)) for x in st):
-            raise SwarmError("state must contain only numbers (got %s); nothing was sent"
-                             % next(type(x).__name__ for x in st
-                                    if isinstance(x, bool) or not isinstance(x, (int, float))))
-        feats = [float(x) for x in st]
-        if not all(math.isfinite(y) for y in feats):
-            bad = next(i for i, y in enumerate(feats) if not math.isfinite(y))
-            raise SwarmError("state must be finite (index %d is NaN or +/-inf); nothing was sent" % bad)
+        feats = _state16(state)
         r = _post("/v1/swarm/hook", {"model_family": model_family, "state": feats}, key=self.key)
         if r.get("hook_verdict") not in self.HOOK_VERDICTS:
             raise SwarmError("service returned an invalid hook_verdict: %r" % (r.get("hook_verdict"),))
@@ -167,6 +174,89 @@ class Swarm:
         if not (1 <= len(items) <= 25):
             raise SwarmError("batch requires 1-25 items (got %d); nothing was sent" % len(items))
         return _post("/v1/swarm/batch", {"items": items}, key=self.key)
+
+    # ------------------------------------------------ swarm control plane (edge >= 1.8.7)
+    def agents_register(self, name, family):
+        """Register an agent on the live swarm control plane:
+        POST /v1/swarm/agents/register {"name", "family"}. Returns the server's
+        receipt verbatim: {"ok": true, "client_id", "agent_id" (always "agt_"-prefixed),
+        "family", "name_sha", "n_agents", "cap" (500), "receipt", "version"}.
+        Each account may hold up to 500 live agents; registration itself consumes
+        no quota. `family` is passed through verbatim — the server owns family
+        validation and any 4xx comes back through the standard error mapping
+        (401/403 -> SwarmNotAuthorized, otherwise SwarmError carrying the server's
+        message)."""
+        if not self.key: raise SwarmNotAuthorized()
+        return _post("/v1/swarm/agents/register", {"name": name, "family": family}, key=self.key)
+
+    def agents_list(self):
+        """GET /v1/swarm/agents — the caller's own swarm roster, owner-scoped (only
+        agents registered under this key are ever returned):
+        {"product", "version", "client_id", "count", "cap" (500),
+        "agents": [{"agent_id", "family", "verdicts_seen", "last_verdict",
+        "flagged_count"}, ...]}. Listing is free: it never consumes quota."""
+        if not self.key: raise SwarmNotAuthorized()
+        return _get("/v1/swarm/agents", key=self.key)
+
+    def agents_gate(self, agent_id, state):
+        """Run one verdict through a registered agent's server-side hook:
+        POST /v1/swarm/agents/gate {"agent_id", "state"}. `state` is the caller's own
+        16-float feature vector; the same client-side guard as hook() runs BEFORE the
+        wire, so a malformed vector costs nothing and burns no quota.
+        Returns the verdict-only hook response: {"hook_verdict":
+        proceed|abstain|repair, "margin", "model", "evidence", "client_id",
+        "agent_id", "flagged", "verdicts_seen", "flagged_count", quota fields,
+        "receipt", "version"} — per-agent counters ride back with the verdict.
+        Gates share the account quota: one gate == one request against the same
+        daily limit (see status()). No model internals cross the boundary in either
+        direction. 401/403 -> SwarmNotAuthorized; other 4xx -> SwarmError."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not isinstance(agent_id, str) or not agent_id:
+            raise SwarmError("agent_id must be a non-empty string; nothing was sent")
+        feats = _state16(state)
+        r = _post("/v1/swarm/agents/gate", {"agent_id": agent_id, "state": feats}, key=self.key)
+        if r.get("hook_verdict") not in self.HOOK_VERDICTS:
+            raise SwarmError("service returned an invalid hook_verdict: %r" % (r.get("hook_verdict"),))
+        return r
+
+    def agents_remove(self, agent_id):
+        """Remove one agent from the caller's swarm: POST /v1/swarm/agents/remove
+        {"agent_id"}. Returns {"ok": true, "client_id", "agent_id", "n_agents",
+        "cap", "receipt", "version"}. Free — removal never consumes quota."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not isinstance(agent_id, str) or not agent_id:
+            raise SwarmError("agent_id must be a non-empty string; nothing was sent")
+        return _post("/v1/swarm/agents/remove", {"agent_id": agent_id}, key=self.key)
+
+    def judge(self, question, choices, votes):
+        """Positional de-bias consensus judge over the caller's registered agents:
+        POST /v1/swarm/judge {"question", "choices", "items"}, where items is the
+        votes list — one {"agent_id", "answer_index"} per agent, at most 50. Duplicate
+        agent_ids are rejected by the server with a 4xx (raised here as SwarmError).
+        Returns the judge verdict: {"product": "lens-swarm-judge-1.0", "client_id",
+        "converged", "answer_index", "leaning_index", "agreement", "n_agents",
+        "dissent", "tied_indices", "debias_offset", "reason", "n_votes", quota fields,
+        "receipt", "version"}. The judge de-biases for answer position across your
+        agents' votes; how it does that is server-side and not part of this contract.
+        A judge call consumes quota like any other request. CLIENT-SIDE GUARD before
+        the wire: votes must be a non-empty list of <= 50 dicts carrying agent_id and
+        integer answer_index, else SwarmError and nothing is sent."""
+        if not self.key: raise SwarmNotAuthorized()
+        if not isinstance(votes, list) or not (1 <= len(votes) <= 50):
+            raise SwarmError("votes must be a non-empty list of <=50 {agent_id, answer_index} "
+                             "items (got %s); nothing was sent"
+                             % ("len %d" % len(votes) if isinstance(votes, list)
+                                else type(votes).__name__))
+        items = []
+        for i, v in enumerate(votes):
+            if not isinstance(v, dict) or "agent_id" not in v or "answer_index" not in v:
+                raise SwarmError("votes[%d] must carry agent_id and answer_index; nothing was sent" % i)
+            ai = v["answer_index"]
+            if isinstance(ai, bool) or not isinstance(ai, int):
+                raise SwarmError("votes[%d].answer_index must be an integer; nothing was sent" % i)
+            items.append({"agent_id": v["agent_id"], "answer_index": ai})
+        return _post("/v1/swarm/judge", {"question": question, "choices": list(choices),
+                                         "items": items}, key=self.key)
 
     def export(self, since=None, until=None):
         """GET /v1/swarm/export?since=<ts>&until=<ts> — fetch the caller's receipt-chain
